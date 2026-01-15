@@ -1,4 +1,3 @@
-from env.task import Task
 import numpy as np
 
 # 模拟不同精度的模型属性
@@ -94,7 +93,7 @@ class LLMModel:
         term2 = coeff_n * n
         return self.L * (term1 + term2)
 
-    def get_resource_costs(self, k, input_tokens, output_tokens, rsu_compute_cap, cot_paths=1):
+    def get_resource_costs(self, rsu, sub_task):
         """
         获取当前任务的资源消耗：执行时间 与 内存占用
 
@@ -105,6 +104,13 @@ class LLMModel:
         :param cot_paths: SC-CoT 推理链条数 J (仅当 use_sot=True 时生效)
         :return: (execution_time_sec, memory_usage_bytes)
         """
+        k = sub_task.precision_req
+        input_tokens = sub_task.Token_in
+        output_tokens = sub_task.Token_out
+        rsu_compute_cap = rsu.compute_capacity
+        cot_paths = sub_task.cot_paths
+
+
         # 1. 获取精度属性
         prec_props = self.precisions[k]
         beta = prec_props['beta']  # 字节/参数

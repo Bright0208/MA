@@ -16,7 +16,6 @@ Rsu_dict = {name :Rsu(conf) for name, conf in RSU_CONFIGS.items()}
 # 实例化车辆
 Vehicle_dict = {name : Vehicle(conf) for name, conf in Vehicle_CONFIGS.items()}
 
-
 if __name__ == "__main__":
     env = Environment(model_library, Rsu_dict, Vehicle_dict)
 

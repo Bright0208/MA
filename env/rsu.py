@@ -15,7 +15,14 @@ class Rsu:
         self.compute_capacity = config['compute_capacity']
         self.range_radius = 100
         self.vehicles = [None] * 20
-        self.model = {}  # 模型种类4种，精度3种
+        # 状态记录
+        self.current_memory_used = 0
+        self.deployed_models = {}  # 模型种类4种，精度3种
+        self.task_queue = []  # 等待处理的任务列表
+        self.pos = np.array([self.x, self.y, self.z])
+
+        # 统计数据 (用于计算公平性 g_m)
+        self.stats = {m: {'success': 0, 'total': 0} for m in ['llama-8b', 'vit-image', 'point-lidar', 'radar-former']}
 
     def add_vehicle(self, vehicle):
 
