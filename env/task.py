@@ -21,7 +21,8 @@ class ParentTask:
                                             required_info['precision'][i],
                                             required_info['Token_in'][i],
                                             required_info['Token_out'][i],
-                                            required_info['cot_paths'][i])
+                                            required_info['cot_paths'][i],
+                                            self.deadline)
 
         # 记录需要完成的子任务状态
         # 格式: {'vit-image': 'pending', 'point-lidar': 'pending'}
@@ -54,7 +55,7 @@ class SubTask:
     子任务 ϕ_{v_i, m_j}(t)
     对应论文  的任务模型部分
     """
-    def __init__(self,parent_id,model_type,precision_req,Token_in,Token_out,cot_paths):
+    def __init__(self,parent_id,model_type,precision_req,Token_in,Token_out,cot_paths,deadline):
         """
         :param vehicle_id: 车辆 id (i)
         :param model_type: 模型类型 mj
@@ -69,6 +70,7 @@ class SubTask:
         self.Token_in = Token_in
         self.Token_out = Token_out
         self.cot_paths = cot_paths
+        self.deadline = deadline
 
 
     # def generate_task(self):

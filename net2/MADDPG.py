@@ -1,11 +1,11 @@
 import torch
 import numpy as np
-from Network import Actor, Critic  # 假设上面的代码存为 network.py
+from net2.net import Actor, Critic  # 假设上面的代码存为 net.py
 
 
 class MADDPG:
     def __init__(self, n_agents, dim_obs, dim_act, batch_size, gamma=0.95, tau=0.01):
-        self.agents = []
+        self.agents = {}
         self.n_agents = n_agents
         self.dim_obs = dim_obs
         self.dim_act = dim_act
@@ -20,19 +20,19 @@ class MADDPG:
         for i in range(n_agents):
             # 每个 Agent 都有自己的 Actor 和 Critic
             agent = Agent(dim_obs, dim_act, n_agents, self.device)
-            self.agents.append(agent)
+            self.agents[f"Rsu_{i}"] = agent
 
     def select_action(self, obs_n):
         """
         执行阶段：分散执行。
         obs_n: list of observations, 每个 agent 一个 obs
         """
-        actions = []
-        for i, agent in enumerate(self.agents):
+        actions = {}
+        for name, agent in self.agents.items():
             # 只输入当前 agent 的观测
-            action = agent.get_action(obs_n[i])
-            actions.append(action)
-        return actions  # 返回动作列表
+            action = agent.get_action(obs_n[name])
+            actions[name] = action
+        return actions  # 返回动作字典
 
     def update(self, replay_buffer):
         """
@@ -136,6 +136,7 @@ class Agent:
         # 探索策略 (Testing时)
         state = torch.FloatTensor(obs).to(self.device).unsqueeze(0)
         logits = self.actor(state)
+        print("logits:",logits)
         # 在执行阶段，我们可以使用 Gumbel-Softmax 进行采样，也可以直接 argmax
         action = torch.nn.functional.gumbel_softmax(logits, hard=True)
         return action.detach().cpu().numpy()[0]

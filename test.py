@@ -13,7 +13,7 @@ replay_buffer = ReplayBuffer(capacity=100000)  # 你需要自己写一个简单�
 MAX_EPISODES = 5000
 
 for episode in range(MAX_EPISODES):
-    obs_n = env.reset()  # 获取所有 RSU 的初始观测 list
+    # obs_n = env.reset()  # 获取所有 RSU 的初始观测 list
     total_reward = 0
 
     for step in range(200):  # 每个 Episode 200 步

@@ -3,11 +3,13 @@ import numpy as np
 from gymnasium import spaces
 import math
 
+from config import Vehicle_CONFIGS
 from env.task import ParentTask
+from env.vehicle import Vehicle
 
 
 def _map_model_id(name):
-    mapping = {'llama-8b': 1, 'vit-image': 2, 'point-lidar': 3, 'radar-former': 4}
+    mapping = {'llama-8b': [1,0,0,0], 'vit-image': [0,1,0,0], 'point-lidar': [0,0,1,0], 'radar-former': [0,0,0,1]}
     return mapping.get(name, 0)
 
 
@@ -51,58 +53,111 @@ class Environment(gym.Env):
         return len(self.rsus)
 
     def get_action_dim(self):
-        # 暂时 5
-        return 5
+        return 10
+    def get_state_dim(self):
+        return 11
 
-    def reset(self):
-        # self.current_step = 0
-        # # 重置 RSU 状态
-        # for name, rsu in  self.rsus.items():
-        #     rsu.current_memory_used = 0
-        #     rsu.deployed_models = {}
-        #     rsu.task_queue = []
-        #     # 重置统计
-        #     for m in rsu.stats:
-        #         rsu.stats[m] = {'success': 0, 'total': 0}
-        # # 重置车辆
-        # # TODO
+    def reset(self, seed=None):
+        """
+        重置环境状态，开始一个新的 Episode。
+        """
+        # 1. 设置随机种子 (Gym 标准做法，保证实验可复现)
+        if seed is not None:
+            np.random.seed(seed)
+
+        # 2. 重置全局计数器
+        self.current_step = 0
+        self.task_registry = {}  # 关键！清空之前的任务记录，防止内存泄漏和ID冲突
+
+        # 3. 重置所有 RSU 的内部状态
+        for name, rsu in self.rsus.items():
+            rsu.current_memory_used = 0
+            rsu.deployed_models = {}  # 清空已部署的模型 (显存归零)
+            rsu.task_queue = []  # 清空等待队列
+
+            # 重置统计数据 (用于计算这一轮 Episode 的公平性)
+            for m in rsu.stats:
+                rsu.stats[m] = {'success': 0, 'total': 0}
+
+        # 4. 重置车辆 (重新生成一波新的车流)
+        self.vehicles = {name : Vehicle(conf) for name, conf in Vehicle_CONFIGS.items()}
+
+
+        # 这一步很重要，能让 Agent 遇到不同的流量分布，提高泛化能力
+        # self.vehicles = []
+        # for i in range(self.n_vehicles):
+        #     # 按照一定比例混合生成不同类型的车
+        #     if i < 3:
+        #         v_type = 'uav_support'  # 3架无人机
+        #     elif i < 8:
+        #         v_type = 'autonomous_car'  # 5辆自动驾驶车
+        #     else:
+        #         v_type = 'connected_car'  # 其余普通车
         #
-        # state = []
-        #
-        # for rsu in self.rsus:
-        #     #reset RSU
-        #     rsu.model = np.zeros((5, 3))  # 模型种类5种，精度3种
-        #     # print("RSU重置")
-        #     #reset 车辆
-        #     for vehicle in rsu.vehicles:
-        #         if vehicle is not None:
-        #             vehicle.x = vehicle.original_x
-        #             # print("车辆重置")
-        #     rsu_state = rsu.get_state()
-        #     # print(rsu_state)
-        #     state.append(rsu_state)
-        # return state
-        return
+        #     # 创建车辆对象 (位置随机分布在道路上)
+        #     v = Vehicle(v_id=i, v_type=v_type)
+        #     self.vehicles.append(v)
+
+        # 5. (可选) 环境预热 / Warm-up
+        # 有时候我们希望 Agent 一上来就面临一个“半忙”的状态，而不是全空的状态
+        # 如果需要，可以在这里调用几次 _generate_new_request
+        # self._random_init_traffic()
+
+        # 6. 生成并返回第一个观测值
+        # 注意: 这里只返回 obs，不返回 info (旧版 Gym API)
+        # 如果是新版 Gym (v0.26+)，需要返回 (obs, info)
+        return self._get_all_observations()
+
+    def _random_init_traffic(self):
+        """
+        辅助函数：随机生成一些初始任务，让 RSU 不那么闲
+        """
+        for _ in range(5):  # 随机生成 5 个初始任务
+            v = np.random.choice(self.vehicles)
+            self._generate_new_request(v)
 
     def _get_all_observations(self):
         # 获取所有 RSU 的观测
-        obs_n = []
-        for rsu in self.rsus:
+        obs_n = {}
+        for name, rsu in self.rsus.items():
             # 1. 获取当前队头任务信息 (如果有)
             if len(rsu.task_queue) > 0:
                 task = rsu.task_queue[0]
-                task_feat = [_map_model_id(task['model_type']), task['input_tokens'] / 1024, task['deadline']]
+                # task_feat = [_map_model_id(task.model_type), task.Token_in / 1024, task.deadline]
+                task_feat = _map_model_id(task.model_type)
+                task_feat.append(task.Token_in / 1024)
+                task_feat.append(task.deadline)
+
+                # 2. 自身资源状态
+                local_load = [rsu.current_memory_used / rsu.memory_capacity, 0.5]  # 假设计算负载
+                model_cache = []
+                if rsu.deployed_models.get(task.model_type, 0) == task.precision_req :
+                    model_cache = [1]
+                    print("部署了模型",task.model_type,"的",task.precision_req ,"精度的")
+                else:
+                    model_cache = [0]
+                    print("没部署模型",task.model_type)
+                #与车辆之间的链路状态，还有车辆是靠近自己还是远离自己
+                parent_task = self.task_registry.get(task.parent_id)
+                vehicle = self.vehicles.get(parent_task.vehicle_id)
+                rate = self._calculate_transmission_rate(vehicle,rsu)
+                rate_ = [rate/1e9]
+                if vehicle.x < rsu.x:
+                    direction_ = [1]
+                else:
+                    direction_ = [0]
+                rsu_state = local_load + model_cache + rate_ + direction_
+
+                # 3. 邻居信息 (可以通过 GNN 聚合，这里先放原始值)
+                # Todo
+                # neighbor_load = [0.0, 0.0]
+                neighbor_load = []
+                obs = np.array(task_feat + rsu_state + neighbor_load)
+                obs_n[name] = obs
             else:
-                task_feat = [0, 0, 0]  # 空闲
+                obs = np.zeros(11)  # 空闲
+                obs_n[name] = obs
 
-            # 2. 自身资源状态
-            local_load = [rsu.current_memory_used / rsu.memory_max, 0.5]  # 假设计算负载
-
-            # 3. 邻居信息 (可以通过 GNN 聚合，这里先放原始值)
-            neighbor_load = [0.0, 0.0]
-
-            obs = np.array(task_feat + local_load + neighbor_load)
-            obs_n.append(obs)
         return obs_n
 
     def step(self, actions_dict):
