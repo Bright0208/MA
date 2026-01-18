@@ -14,14 +14,13 @@ class ParentTask:
         self.created_time = 0  # 会在生成时赋值
 
 
-
         self.sub_tasks = {}
         for i, model in enumerate(required_info['models']):
             self.sub_tasks[model] = SubTask(self.task_id,model,
                                             required_info['precision'][i],
                                             required_info['Token_in'][i],
                                             required_info['Token_out'][i],
-                                            required_info['cot_paths'][i],
+                                            required_info['cot_paths'],
                                             self.deadline)
 
         # 记录需要完成的子任务状态

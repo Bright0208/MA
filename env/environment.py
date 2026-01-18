@@ -81,7 +81,8 @@ class Environment(gym.Env):
 
         # 4. 重置车辆 (重新生成一波新的车流)
         self.vehicles = {name : Vehicle(conf) for name, conf in Vehicle_CONFIGS.items()}
-
+        for v_name, vehicle in self.vehicles.items():
+            self._generate_new_request(vehicle)
 
         # 这一步很重要，能让 Agent 遇到不同的流量分布，提高泛化能力
         # self.vehicles = []
@@ -133,13 +134,14 @@ class Environment(gym.Env):
                 model_cache = []
                 if rsu.deployed_models.get(task.model_type, 0) == task.precision_req :
                     model_cache = [1]
-                    print("部署了模型",task.model_type,"的",task.precision_req ,"精度的")
+                    # print("部署了模型",task.model_type,"的",task.precision_req ,"精度的")
                 else:
                     model_cache = [0]
-                    print("没部署模型",task.model_type)
+                    # print("没部署模型",task.model_type)
                 #与车辆之间的链路状态，还有车辆是靠近自己还是远离自己
                 parent_task = self.task_registry.get(task.parent_id)
-                vehicle = self.vehicles.get(parent_task.vehicle_id)
+                # print("parent_task:",parent_task.vehicle_id)
+                vehicle = self.vehicles.get(f"V_{parent_task.vehicle_id}")
                 rate = self._calculate_transmission_rate(vehicle,rsu)
                 rate_ = [rate/1e9]
                 if vehicle.x < rsu.x:
@@ -165,12 +167,23 @@ class Environment(gym.Env):
         核心循环: 执行动作 -> 计算时延 -> 计算 Reward
         actions: list of action indices, e.g., [2, 9, 3] 对应 3 个 RSU 的决策
         """
-        reward_n = {}  # 每一个RSU（Agent） 的奖励
-        done_n = [False] * len(self.rsus)
+        reward_n = {}
+        done_n = {}
+        for name, rsu in self.rsus.items():
+            reward_n[name] = 0  # 每一个RSU（Agent） 的奖励
+            done_n[name] = False
         info = {}
 
         # --- Phase 1: 执行每个 RSU 的决策 ---
-        for name, action in actions_dict.items():   #actions 是列表，不合适，应该也是字典
+        for name, action_index in actions_dict.items():   #actions 是列表，不合适，应该也是字典
+
+            # 1. 在局部变量里转换，不要写回 actions_dict！
+            # 只要不执行 actions_dict[rsu_name] = ...，外面就不会变
+            if isinstance(action_index, np.ndarray):
+                action = np.argmax(action_index)
+            else:
+                action = action_index  # 防止已经是int的情况
+
             rsu = self.rsus[name]
 
             print("此时的Rsu是：",rsu.id,"此时的动作是：",action)
@@ -178,7 +191,7 @@ class Environment(gym.Env):
             reward = 0
             success = False
             finish_time = math.inf  #完成时间初始为正无穷
-            exe_time = 0
+            total_time = 0
             mem_cost = 0
             load_time = 0
 
@@ -189,13 +202,13 @@ class Environment(gym.Env):
 
             # 取出子任务
             sub_task = rsu.task_queue.pop(0)
-            print("sub_task",sub_task)
+            print("此时的sub_task是：",sub_task)
             parent_id = sub_task.parent_id
             parent = self.task_registry[parent_id]  # 获取父任务对象
 
             # 如果父任务之前已经有别的子任务失败了，这个子任务就没必要做了（剪枝）
             if parent.failed:
-                reward_n[name] += -0.2  # 或者给一点微小的负分，惩罚资源浪费
+                reward_n[name] -= 0.2  # 或者给一点微小的负分，惩罚资源浪费
 
                 continue
 
@@ -206,8 +219,6 @@ class Environment(gym.Env):
             is_local = action < 3
             is_offload = 3 <= action < 9
             is_drop = action == 9
-
-
             precision = (action % 3) + 1  # k=1,2,3
 
             if is_drop: # 丢弃，不执行，此时父任务直接失败
@@ -222,10 +233,9 @@ class Environment(gym.Env):
 
                 # todo 检查 RSU已经部署的模型列表
                 if sub_task.model_type in rsu.deployed_models and rsu.deployed_models[sub_task.model_type] == sub_task.precision_req:
-
                     # 代表对应精度的模型已经部署，可以直接执行
                     exe_time, mem_cost = self.LLMModel[sub_task.model_type].get_resource_costs(rsu, sub_task)
-
+                    total_time = exe_time
                 # 对应精度的模型没有部署，需要加载。
                 else:
                     print("没有部署",sub_task.model_type,sub_task.precision_req,"精度的模型")
@@ -250,7 +260,7 @@ class Environment(gym.Env):
                     # total_time = exe_time  # + 传输时间 (本地忽略 V2I)
 
                     finish_time = self.current_step  * self.dt + total_time
-                    if total_time <= (parent.deadline - self.current_step * self.dt):
+                    if finish_time <= (parent.deadline - self.current_step * self.dt):
                         rsu.stats[sub_task.model_type]['success'] += 1
                         # 奖励 = 基础分 + 剩余时间奖励
                         reward = 10 + (1.0 / total_time)
@@ -260,18 +270,27 @@ class Environment(gym.Env):
 
             elif is_offload:
                 # --- 卸载逻辑 ---
+                # 先判断自身是否有邻居
+
                 # 确定目标邻居 ID
-                target_rsu_id = (rsu_idx + 1) if action < 6 else (rsu_idx - 1)
-                target_rsu_id = max(0, min(target_rsu_id, self.n_rsus - 1))  # 边界处理
+                target_rsu_id = (rsu.id - 1) if action < 6 else (rsu.id + 1)
+                # target_rsu_id = max(0, min(target_rsu_id, self.n_rsus - 1))  # 边界处理
 
-                # 计算 RSU 间传输时延
-                trans_time = 0.1  # 假设光纤直连 100ms
+                if target_rsu_id == -1  or target_rsu_id == 6: #没有左邻居、 没有右邻居 惩罚
+                    reward = -5
+                else:
 
-                # ... 类似本地执行的检查逻辑，但要加上 trans_time ...
-                finish_time = self.current_step * self.dt + total_time
+                    # 计算 RSU 间传输时延
+                    trans_time = 0.1  # 假设光纤直连 100ms
 
-                reward = 5  # 卸载成功的奖励通常略低于本地（因为占用了带宽）
-                success = True
+                    exe_time, mem_cost = self.LLMModel[sub_task.model_type].get_resource_costs(rsu, sub_task)
+
+                    total_time = exe_time + trans_time
+                    # ... 类似本地执行的检查逻辑，但要加上 trans_time ...
+                    finish_time = self.current_step * self.dt + total_time
+
+                    reward = 5  # 卸载成功的奖励通常略低于本地（因为占用了带宽）
+                    success = True
 
             reward_n[name] = reward
 
@@ -310,8 +329,8 @@ class Environment(gym.Env):
             else:
                 # 子任务失败 (OOM 或单体超时)
                 parent.failed = True
-                parent.sub_task_status[sub_task['model_type']] = 'failed'
-                reward_n[rsu_idx] -= 20  # 严重惩罚，因为搞砸了整个父任务
+                parent.sub_task_status[sub_task.model_type] = 'failed'
+                reward_n[name] -= 20  # 严重惩罚，因为搞砸了整个父任务
         # --- Phase 2: 全局公平性修正 (Fairness) ---
         # 你的论文核心: max min g_m
         # 计算所有任务类型的完成率
@@ -331,56 +350,128 @@ class Environment(gym.Env):
             # 关键：将公平性加入每个 Agent 的 Reward
             # 这样 Agent 就不仅关注自己的任务，还会关注整体“短板”
             fairness_bonus = 20 * min_completion_rate + 10 * jains_index
-            reward_n = [r + fairness_bonus for r in reward_n]
+            # reward_n = [r + fairness_bonus for name, r in reward_n.items()]
+            for name, r in reward_n.items():
+                reward_n[name] = r + fairness_bonus
 
         # --- Phase 3: 环境更新 ---
-        self._update_vehicles_and_generate_tasks()
+        for name, v in self.vehicles.items():
+            self._update_vehicles(v)
+            self._generate_new_request(v)
         self.current_step += 1
 
         if self.current_step >= self.max_steps:
-            done_n = [True] * len(self.rsus)
+            for name, done in done_n.items():
+                done_n[name] = True
 
         return self._get_all_observations(), reward_n, done_n, info
 
-    def _update_vehicles_and_generate_tasks(self):
-        # 1. 车辆移动
-        # 2. 概率生成新任务并放入对应 RSU 的 task_queue
-        # 模拟生成一个任务放入 RSU 0
-        if np.random.rand() > 0.5:
-            new_task = {
-                'model_type': 'llama-8b',
-                'input_tokens': 512,
-                'deadline': self.current_step * self.dt + 2.0
-            }
-            self.rsus[0].task_queue.append(new_task)
+
+    def _update_vehicles(self, vehicle):
+        vehicle.move()
 
     def _generate_new_request(self, vehicle):
-        # 1. 创建父任务
-        # 假设这辆车需要同时处理 图像、雷达 和 LLM
-        models = ['vit-image', 'radar-former', 'llama-8b']
-        precision =[2, 2, 2]
-        Token_in = [40, 40, 25]
-        Token_out = [30, 5, 40]
-        cot_paths = 1
-        required_info = {'models': models,
-                         'precision': precision,
-                         'Token_in':Token_in,
-                         'Token_out':Token_out,
-                         'deadline': self.current_step * self.dt + 2.0,
-                         'cot_paths': cot_paths}
+        """
+        为车辆随机生成一个多模态父任务
+        """
+        # 1. 确定该任务包含哪些模态 (专家模型)
+        # 获取所有可用的模型类型 (llama-8b, vit-image, etc.)
+        all_model_types = list(self.LLMModel.keys())
 
+        # 随机决定这个父任务需要协同几个专家 (例如 1 到 3 个)
+        # 复杂任务可能需要 3 个模型 (如: 图像 + 雷达 + LLM 融合)
+        num_models = np.random.randint(1, len(all_model_types) + 1)
+
+        # 无放回抽样，选出具体的模型列表
+        selected_models = np.random.choice(all_model_types, num_models, replace=False).tolist()
+
+        # 2. 为每个选定的模型生成具体的任务参数
+        token_in_list = []
+        token_out_list = []
+        precision_req_list = []  # 这里指任务产生时的"期望精度"或"原始精度"
+
+        # 设定 SC-CoT 的路径数 (仅对 LLM 有效) [cite: 108]
+        # 如果任务不含 LLM，这个值为 1；如果有 LLM，随机生成 1~3 条推理链
+        cot_paths = 1
+
+        for m_name in selected_models:
+            # --- A. 针对 LLM (llama-8b) 的特殊生成逻辑 ---
+            if 'llama' in m_name:
+                # LLM 输入通常较长 (Prompt)，输出也较长 (推理/生成)
+                t_in = np.random.randint(128, 1024)
+                t_out = np.random.randint(32, 256)
+                # 随机决定推理链条数 (模拟复杂推理任务的不确定性)
+                cot_paths = np.random.randint(1, 4)
+
+                # --- B. 针对感知模型 (ViT, Lidar, Radar) 的生成逻辑 ---
+            else:
+                # 感知模型输入通常是固定的 Patch/Point 数量，这里模拟为 Token 数
+                # ViT/Lidar 输入大，Radar 输入小
+                if 'radar' in m_name:
+                    t_in = np.random.randint(32, 128)
+                else:
+                    t_in = np.random.randint(196, 512)  # 如 ViT patch 数
+
+                # 感知模型的输出通常很短 (分类标签或坐标)，计算量主要在 Prefill
+                t_out = np.random.randint(5, 20)
+
+            # 随机生成该子任务的最低精度要求 (1:FP16, 2:INT8, 3:INT4)
+            # 模拟：有些关键安全任务要求 FP16，有些容忍 INT4
+            prec = np.random.choice([1, 2, 3], p=[0.2, 0.5, 0.3])
+
+            token_in_list.append(t_in)
+            token_out_list.append(t_out)
+            precision_req_list.append(prec)
+
+        # 3. 生成截止时间 (Deadline)
+        # 任务越复杂 (Token多)，给的容忍时间通常稍微宽裕一点，但也有随机扰动
+        # 基础容忍时间 0.5s ~ 3.0s
+        tolerance = np.random.uniform(0.5, 3.0)
+        deadline = self.current_step * self.dt + tolerance
+
+        # 4. 打包所需信息字典 (对应 Image 2 的格式)
+        required_info = {
+            'models': selected_models,
+            'precision': precision_req_list,  # 注意：这是需求，Agent决策时可能会调整
+            'Token_in': token_in_list,
+            'Token_out': token_out_list,
+            'deadline': deadline,
+            'cot_paths': cot_paths  # [cite: 114]
+        }
+
+        # 5. 实例化父任务并注册
         task_id = f"v{vehicle.id}_t{self.current_step}"
         parent_task = ParentTask(task_id, vehicle.id, required_info)
         parent_task.created_time = self.current_step * self.dt
 
-        # 2. 注册到全局表
+        # 6. 注册到全局表
         self.task_registry[task_id] = parent_task
 
-        # 3. 拆解子任务并放入最近 RSU 的队列
+        # 7. (关键步骤) 将子任务分发到最近 RSU 的等待队列
+        # 这样 Agent 在 step() 时才能看到任务
         nearest_rsu = self._find_nearest_rsu(vehicle)
 
         for name, sub_task in parent_task.sub_tasks.items():
             nearest_rsu.task_queue.append(sub_task)
+
+        # if nearest_rsu:
+        #     # 遍历生成的模型列表，拆解为子任务
+        #     for idx, model_type in enumerate(selected_models):
+        #         sub_task = {
+        #             'parent_id': task_id,
+        #             'vehicle_id': vehicle.id,
+        #             'model_type': model_type,
+        #             'input_tokens': token_in_list[idx],
+        #             'output_tokens': token_out_list[idx],
+        #             'req_precision': precision_req_list[idx],  # 记录原始需求
+        #             'deadline': deadline,
+        #             'cot_paths': cot_paths if 'llama' in model_type else 1,
+        #             'timestamp': self.current_step * self.dt
+        #         }
+        #         nearest_rsu.task_queue.append(sub_task)
+
+        # return task_id
+
 
 
     def _calc_jains_index(self, rates):
@@ -405,7 +496,7 @@ class Environment(gym.Env):
         # 假设 Vehicle 类有 get_position() 方法返回 np.array([x, y, z])
         v_pos = vehicle.get_position()
 
-        for rsu in self.rsus:
+        for name, rsu in self.rsus.items():
             # 计算距离: sqrt((x1-x2)^2 + ...)
             # rsu.pos 在 RSU 初始化时已定义为 np.array
             dist = np.linalg.norm(v_pos - rsu.pos)

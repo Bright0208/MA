@@ -31,7 +31,10 @@ class MADDPG:
         for name, agent in self.agents.items():
             # 只输入当前 agent 的观测
             action = agent.get_action(obs_n[name])
+            # print("MADDPG 34 aciton",action)
+
             actions[name] = action
+
         return actions  # 返回动作字典
 
     def update(self, replay_buffer):
@@ -41,6 +44,8 @@ class MADDPG:
         # 1. 从经验池采样
         # sample 包含所有智能体的 (obs, action, reward, next_obs, done)
         obs_n, act_n, r_n, next_obs_n, done_n = replay_buffer.sample(self.batch_size)
+
+        # print("MADDPG 48 obs_n",obs_n)
 
         # 转为 Tensor 并放到 GPU
         # obs_n 的形状: [batch, n_agent, dim_obs]
@@ -54,9 +59,10 @@ class MADDPG:
         # 关键步骤：为了计算 Critic Loss，我们需要所有 Agent 下一步的动作
         # ----------------------------------------
         target_act_next_n = []
-        for i, agent in enumerate(self.agents):
+        for name, agent in self.agents.items():
             # 使用 Target Actor 网络预测下一步动作
             # 注意：这里必须使用 Gumbel-Softmax 保持可微性，或者在 Target 中直接 argmax
+            i = int(name.split('_')[1])
             target_act_next = agent.actor_target(next_obs_n[:, i])
             # Gumbel-Softmax 处理
             target_act_next = torch.nn.functional.gumbel_softmax(target_act_next, hard=True)
@@ -73,7 +79,8 @@ class MADDPG:
         # ----------------------------------------
         # 循环更新每一个 Agent
         # ----------------------------------------
-        for i, agent in enumerate(self.agents):
+        for name, agent in self.agents.items():
+            i = int(name.split('_')[1])
             # --- 1. 更新 Critic ---
             # 计算目标 Q 值 (Target Q)
             with torch.no_grad():
@@ -96,7 +103,8 @@ class MADDPG:
             # 技巧：我们需要重新计算当前的 actions，因为 buffer 里的 actions 是旧策略产生的，没有梯度
 
             curr_act_n = []
-            for j, ag in enumerate(self.agents):
+            for name_, ag in self.agents.items():
+                j = int(name_.split('_')[1])
                 act_logits = ag.actor(obs_n[:, j])
                 # 必须使用 Gumbel-Softmax !
                 # 这样 Critic 对 action 的梯度才能传回给 Actor
@@ -136,9 +144,12 @@ class Agent:
         # 探索策略 (Testing时)
         state = torch.FloatTensor(obs).to(self.device).unsqueeze(0)
         logits = self.actor(state)
-        print("logits:",logits)
+
+        # print("MADDPG.py: logits:",logits)
+
         # 在执行阶段，我们可以使用 Gumbel-Softmax 进行采样，也可以直接 argmax
         action = torch.nn.functional.gumbel_softmax(logits, hard=True)
+        # print("MADDPG 145 action",action)
         return action.detach().cpu().numpy()[0]
 
     def update_target(self, tau):
