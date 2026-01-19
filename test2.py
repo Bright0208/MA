@@ -1,11 +1,10 @@
 import numpy as np
-import torch
-
+from torch.utils.tensorboard import SummaryWriter
+import datetime
 from env.environment import Environment
 from config import device, MODELS_CONFIG, RSU_CONFIGS, Vehicle_CONFIGS
 from env.llm_model import LLMModel
 from env.rsu import Rsu
-from env.task import SubTask, ParentTask
 from env.vehicle import Vehicle
 from net2.MADDPG import MADDPG
 from net2.ReplayBuffer import ReplayBuffer
@@ -18,47 +17,39 @@ Rsu_dict = {name :Rsu(conf) for name, conf in RSU_CONFIGS.items()}
 # 实例化车辆
 Vehicle_dict = {name : Vehicle(conf) for name, conf in Vehicle_CONFIGS.items()}
 
-# 给Rsu任务队列里面加点任务
-# 假设这辆车需要同时处理 图像、雷达 和 LLM
-# models = ['vit-image', 'radar-former', 'llama-8b']
-# precision = [2, 2, 2]
-# Token_in = [40, 40, 25]
-# Token_out = [30, 5, 40]
-# cot_paths = [1, 1, 3]
-# required_info = {'models': models,
-#                  'precision': precision,
-#                  'Token_in': Token_in,
-#                  'Token_out': Token_out,
-#                  'deadline':   2.0,
-#                  'cot_paths': cot_paths}
 
-# task_id = f"v{vehicle.id}_t{self.current_step}"
-# task_id = "0"
-# parent_task = ParentTask(task_id, "V_0", required_info)
+env = Environment(model_library, Rsu_dict, Vehicle_dict)
+env.determine_vehicle_ownership()
 
-# for name, rsu in Rsu_dict.items():
-#     for name, sub_task in parent_task.sub_tasks.items():
-#         rsu.task_queue.append(sub_task)
-#     rsu.deployed_models ={'llama-8b':2,"vit-image":2,"point-lidar":1,"radar-former":3}
-#     # print(rsu.task_queue)
+n_agent = env.get_agent_numbers()  # 获得智能体数量
+state_dim = env.get_state_dim()  # 通过state获得state_dim
+action_dim = env.get_action_dim()  # 获得action_dim
+
+maddpg = MADDPG(n_agent, state_dim, action_dim, 64)
+replay_buffer = ReplayBuffer(capacity=100000)  # 你需要自己写一个简单的 Buffer 类
+MAX_EPISODES = 5000
 
 
 if __name__ == "__main__":
-    env = Environment(model_library, Rsu_dict, Vehicle_dict)
-    env.determine_vehicle_ownership()
-
-    n_agent = env.get_agent_numbers()   #获得智能体数量
-    state_dim = env.get_state_dim()          #通过state获得state_dim
-    action_dim = env.get_action_dim()   #获得action_dim
-
-    maddpg = MADDPG(n_agent,state_dim,action_dim,64)
-    replay_buffer = ReplayBuffer(capacity=100000)  # 你需要自己写一个简单的 Buffer 类
-    MAX_EPISODES = 5000
-
+    # ... (初始化) ...
+    # === 1. 新增记录列表 ===
+    all_ep_rewards = []  # 记录 Reward
+    all_critic_losses = []  # 记录 Critic Loss
+    all_actor_losses = []  # 记录 Actor Loss
+    # === 初始化 Tensorboard Writer ===
+    # 日志会保存在 runs/文件夹下，加上时间戳防止覆盖
+    log_dir = "runs/MADDPG_" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    writer = SummaryWriter(log_dir)
+    print(f"TensorBoard 启动中... 日志目录: {log_dir}")
+    print("请在终端运行: tensorboard --logdir=runs 来查看实时图表")
     for episode in range(MAX_EPISODES):
-
-        obs_n = env.reset(seed=42)  # 获取所有 RSU 的初始观测 list
+        # ... (训练循环) ...
+        obs_n = env.reset()  # 获取所有 RSU 的初始观测 list
         total_reward = 0
+        # 记录这一个 Episode 里每一步的 Loss，最后求平均
+        step_c_losses = []
+        step_a_losses = []
+
         for step in range(200):  # 每个 Episode 200 步
             # 1. 选择动作
             actions_n = maddpg.select_action(obs_n)
@@ -100,15 +91,48 @@ if __name__ == "__main__":
 
             # 4. 开始训练 (当数据足够时)
             if len(replay_buffer) > 64:
-                maddpg.update(replay_buffer)
+                c_loss, a_loss = maddpg.update(replay_buffer)
+                step_c_losses.append(c_loss)
+                step_a_losses.append(a_loss)
 
             if all(done_n):
                 break
+        # === 3. 记录本轮数据 ===
+        all_ep_rewards.append(total_reward)
 
+        # 在 Episode 结束时记录
         print(f"Episode {episode}: Reward = {total_reward}")
 
+        # 如果这一轮进行了训练，计算平均 Loss；否则记为 0
+        if len(step_c_losses) > 0:
+            avg_c = np.mean(step_c_losses)
+            avg_a = np.mean(step_a_losses)
+        else:
+            avg_c, avg_a = 0, 0
 
+        all_critic_losses.append(avg_c)
+        all_actor_losses.append(avg_a)
+        # === 写入 Tensorboard ===
+        # 记录总奖励
+        writer.add_scalar('Reward/Total_Reward', total_reward, episode)
+        # ======================================================
+        # [新增] 计算平均值并写入 TensorBoard
+        # ======================================================
+        # 1. 记录总奖励 (Total Reward)
+        writer.add_scalar('Main/Total_Reward', total_reward, episode)
 
+        # 2. 记录平均 Loss (如果本轮进行了训练)
+        if len(step_c_losses) > 0:
+            avg_c_loss = np.mean(step_c_losses)
+            avg_a_loss = np.mean(step_a_losses)
 
+            writer.add_scalar('Loss/Critic_Loss', avg_c_loss, episode)
+            writer.add_scalar('Loss/Actor_Loss', avg_a_loss, episode)
+
+        # 打印进度
+        # 如果你想看每一步的平均 Loss (需要在 maddpg.update 里返回 loss)
+        # writer.add_scalar('Loss/Critic_Loss', critic_loss, episode)
+
+    writer.close()
 
 

@@ -55,6 +55,10 @@ class MADDPG:
         next_obs_n = torch.FloatTensor(next_obs_n).to(self.device)
         done_n = torch.FloatTensor(done_n).to(self.device)
 
+        # === 新增：用于记录总 Loss 的变量 ===
+        total_critic_loss = 0.0
+        total_actor_loss = 0.0
+
         # ----------------------------------------
         # 关键步骤：为了计算 Critic Loss，我们需要所有 Agent 下一步的动作
         # ----------------------------------------
@@ -94,6 +98,9 @@ class MADDPG:
             # Critic Loss (MSE)
             critic_loss = torch.nn.functional.mse_loss(current_q, target_q)
 
+            # === 新增：累加 Critic Loss ===
+            total_critic_loss += critic_loss.item()
+
             agent.optimizer_c.zero_grad()
             critic_loss.backward()
             agent.optimizer_c.step()
@@ -117,13 +124,17 @@ class MADDPG:
             # 这里的 Critic 是 Agent i 自己的 Critic，但输入了所有人的动作
             actor_loss = -agent.critic(obs_n_flat, curr_act_n_flat).mean()
 
+            # === 新增：累加 Actor Loss ===
+            total_actor_loss += actor_loss.item()
+
             agent.optimizer_a.zero_grad()
             actor_loss.backward()
             agent.optimizer_a.step()
 
             # --- 3. 软更新 Target 网络 ---
             agent.update_target(self.tau)
-
+            # === 新增：返回平均 Loss ===
+        return total_critic_loss / self.n_agents, total_actor_loss / self.n_agents
 
 class Agent:
     def __init__(self, dim_obs, dim_act, n_agents, device):

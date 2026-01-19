@@ -149,7 +149,7 @@ class LLMModel:
 
         execution_time = total_flops / eff_capacity
 
-        return execution_time, total_memory
+        return execution_time, mem_static, mem_kv
 
 
 

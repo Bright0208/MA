@@ -8,9 +8,7 @@ from env.task import ParentTask
 from env.vehicle import Vehicle
 
 
-def _map_model_id(name):
-    mapping = {'llama-8b': [1,0,0,0], 'vit-image': [0,1,0,0], 'point-lidar': [0,0,1,0], 'radar-former': [0,0,0,1]}
-    return mapping.get(name, 0)
+
 
 
 class Environment(gym.Env):
@@ -37,7 +35,7 @@ class Environment(gym.Env):
 
         # --- 3. 观测空间 (Observation Space) ---
         # [任务类型ID, 任务数据量, 容忍时延, 本地CPU利用率, 本地内存利用率, 邻居1负载, 邻居2负载...]
-        self.obs_dim = 3 + 2 + 2  # 简单示例: 7维
+        self.obs_dim = 12  # 简单示例: 11维
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.obs_dim,), dtype=np.float32)
 
 
@@ -55,7 +53,7 @@ class Environment(gym.Env):
     def get_action_dim(self):
         return 10
     def get_state_dim(self):
-        return 11
+        return 12
 
     def reset(self, seed=None):
         """
@@ -74,6 +72,8 @@ class Environment(gym.Env):
             rsu.current_memory_used = 0
             rsu.deployed_models = {}  # 清空已部署的模型 (显存归零)
             rsu.task_queue = []  # 清空等待队列
+            # [新增] 初始化上一步状态记录 (0 表示无事发生)
+            rsu.last_exec_status = 0.0
 
             # 重置统计数据 (用于计算这一轮 Episode 的公平性)
             for m in rsu.stats:
@@ -83,26 +83,6 @@ class Environment(gym.Env):
         self.vehicles = {name : Vehicle(conf) for name, conf in Vehicle_CONFIGS.items()}
         for v_name, vehicle in self.vehicles.items():
             self._generate_new_request(vehicle)
-
-        # 这一步很重要，能让 Agent 遇到不同的流量分布，提高泛化能力
-        # self.vehicles = []
-        # for i in range(self.n_vehicles):
-        #     # 按照一定比例混合生成不同类型的车
-        #     if i < 3:
-        #         v_type = 'uav_support'  # 3架无人机
-        #     elif i < 8:
-        #         v_type = 'autonomous_car'  # 5辆自动驾驶车
-        #     else:
-        #         v_type = 'connected_car'  # 其余普通车
-        #
-        #     # 创建车辆对象 (位置随机分布在道路上)
-        #     v = Vehicle(v_id=i, v_type=v_type)
-        #     self.vehicles.append(v)
-
-        # 5. (可选) 环境预热 / Warm-up
-        # 有时候我们希望 Agent 一上来就面临一个“半忙”的状态，而不是全空的状态
-        # 如果需要，可以在这里调用几次 _generate_new_request
-        # self._random_init_traffic()
 
         # 6. 生成并返回第一个观测值
         # 注意: 这里只返回 obs，不返回 info (旧版 Gym API)
@@ -125,7 +105,7 @@ class Environment(gym.Env):
             if len(rsu.task_queue) > 0:
                 task = rsu.task_queue[0]
                 # task_feat = [_map_model_id(task.model_type), task.Token_in / 1024, task.deadline]
-                task_feat = _map_model_id(task.model_type)
+                task_feat = self._map_model_id(task.model_type)
                 task_feat.append(task.Token_in / 1024)
                 task_feat.append(task.deadline)
 
@@ -148,7 +128,12 @@ class Environment(gym.Env):
                     direction_ = [1]
                 else:
                     direction_ = [0]
-                rsu_state = local_load + model_cache + rate_ + direction_
+
+                # [新增] 第 12 维：上一步的执行结果
+                # 注意：这个特征即使队列为空也存在（反映 Agent 最近的状态）
+                # 把它放在最后一位 (Index 11)
+                last_task_state_ = [rsu.last_exec_status]
+                rsu_state = local_load + model_cache + rate_ + direction_ + last_task_state_
 
                 # 3. 邻居信息 (可以通过 GNN 聚合，这里先放原始值)
                 # Todo
@@ -157,7 +142,7 @@ class Environment(gym.Env):
                 obs = np.array(task_feat + rsu_state + neighbor_load)
                 obs_n[name] = obs
             else:
-                obs = np.zeros(11)  # 空闲
+                obs = np.zeros(12)  # 空闲
                 obs_n[name] = obs
 
         return obs_n
@@ -167,154 +152,267 @@ class Environment(gym.Env):
         核心循环: 执行动作 -> 计算时延 -> 计算 Reward
         actions: list of action indices, e.g., [2, 9, 3] 对应 3 个 RSU 的决策
         """
+        # 初始化 要记录的信息
         reward_n = {}
         done_n = {}
+        info = {}
         for name, rsu in self.rsus.items():
             reward_n[name] = 0  # 每一个RSU（Agent） 的奖励
             done_n[name] = False
-        info = {}
+            info[name] = {}
+
 
         # --- Phase 1: 执行每个 RSU 的决策 ---
         for name, action_index in actions_dict.items():   #actions 是列表，不合适，应该也是字典
 
-            # 1. 在局部变量里转换，不要写回 actions_dict！
-            # 只要不执行 actions_dict[rsu_name] = ...，外面就不会变
+            # 将10维的动作 argmax 变成一维的动作
             if isinstance(action_index, np.ndarray):
                 action = np.argmax(action_index)
             else:
                 action = action_index  # 防止已经是int的情况
 
+            # 将动作解码
+            is_local = action < 3        #本地0高 1中 2低 精度执行
+            is_offload = 3 <= action < 9   #左邻居 3高 4中 5低    右邻居 6高 7中 8低
+            is_drop = action == 9          #丢弃 无法执行
+            precision = (action % 3) + 1  # k=1,2,3
+
             rsu = self.rsus[name]
 
-            print("此时的Rsu是：",rsu.id,"此时的动作是：",action)
+            # print("此时的Rsu是：",rsu.id,"此时的动作是：",action)
 
+            # 这个Rsu这一次动作的Reward
             reward = 0
-            success = False
+            success = False    #用来判断父任务是否完成
             finish_time = math.inf  #完成时间初始为正无穷
-            total_time = 0
-            mem_cost = 0
-            load_time = 0
 
             # 如果队列为空，动作无效，给予小惩罚鼓励空闲时休眠或预取
             if len(rsu.task_queue) == 0:
-                print("队列为空，跳出循环")
+                reward_n[name] = 0.1
+                # print("队列为空，跳出循环")
+                rsu.last_exec_status = 0.1  # [记录] 空闲
                 continue
 
             # 取出子任务
             sub_task = rsu.task_queue.pop(0)
-            print("此时的sub_task是：",sub_task)
+            # print("此时的sub_task是：",sub_task)
+            #找到子任务的父任务
             parent_id = sub_task.parent_id
             parent = self.task_registry[parent_id]  # 获取父任务对象
 
             # 如果父任务之前已经有别的子任务失败了，这个子任务就没必要做了（剪枝）
             if parent.failed:
                 reward_n[name] -= 0.2  # 或者给一点微小的负分，惩罚资源浪费
-
+                rsu.last_exec_status = 0.2  # [记录] 不用做
                 continue
 
-            # 给这类服务的总数加一
+
+            # 给这类服务的总数加一，准备执行这个任务了
             rsu.stats[sub_task.model_type]['total'] += 1
 
-            # 解码动作
-            is_local = action < 3
-            is_offload = 3 <= action < 9
-            is_drop = action == 9
-            precision = (action % 3) + 1  # k=1,2,3
-
+            #判断动作，如果是丢弃
             if is_drop: # 丢弃，不执行，此时父任务直接失败
                 # 拒绝惩罚
-                reward = -5
+                parent.failed = True
+                rsu.last_exec_status = -0.2  # [记录] 主动丢弃
+                reward = -10
 
             elif is_local:
                 # --- 本地RSU直接执行逻辑 ---
-                # 1. 检查内存是否足够部署 (公式 C3)
-                # 这是一个简化：如果没部署，需要加载时间；如果已部署但精度不同，需要重载
-                # 计算 cost (调用 LLMModel)
-
-                # todo 检查 RSU已经部署的模型列表
-                if sub_task.model_type in rsu.deployed_models and rsu.deployed_models[sub_task.model_type] == sub_task.precision_req:
-                    # 代表对应精度的模型已经部署，可以直接执行
-                    exe_time, mem_cost = self.LLMModel[sub_task.model_type].get_resource_costs(rsu, sub_task)
+                # 1. 先检查模型是否已经部署
+                if sub_task.model_type in rsu.deployed_models and rsu.deployed_models[sub_task.model_type] <= sub_task.precision_req:
+                    # 代表对应精度或者更高精度的模型已经部署，可以直接执行
+                    # 计算 cost (调用 LLMModel)
+                    exe_time, mem_static, mem_kv = self.LLMModel[sub_task.model_type].get_resource_costs(rsu, sub_task)
                     total_time = exe_time
+                    # 如果内存超了，就要惩罚
+                    if rsu.current_memory_used + mem_kv > rsu.memory_capacity:
+                        # OOM 失败 此时父任务直接失败
+                        parent.failed = True
+                        rsu.last_exec_status = -1.0  # [记录] 严重错误：OOM
+                        reward = -5  # 严重惩罚
+                    else:# 内存没超
+                        finish_time = self.current_step * self.dt + total_time
+                        if finish_time <= (parent.deadline - self.current_step * self.dt):
+                            rsu.stats[sub_task.model_type]['success'] += 1
+                            # 奖励 = 基础分 + 剩余时间奖励
+                            # 计算类型最小完成率
+                            rate = 0
+                            for n, model in rsu.stats.items():
+                                if model['total'] != 0:
+                                    rate_ = model['success'] / model['total']
+                                    rate = rate_ if rate_ > rate else rate
+                                else:
+                                    rate_ = 0
+                                    rate = rate_
+                            reward = 10 + rate + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
+                            rsu.last_exec_status = 1.0  # [记录] 完美成功
+                            success = True
+                        else:
+                            parent.failed = True
+                            rsu.last_exec_status = -0.5  # [记录] 虽然做了但超时
+                            reward = -2  # 超时惩罚
+
                 # 对应精度的模型没有部署，需要加载。
                 else:
-                    print("没有部署",sub_task.model_type,sub_task.precision_req,"精度的模型")
+                    load_time = 1.00  # 先假设加载时间是1.02
+                    exe_time, mem_static, mem_kv = self.LLMModel[sub_task.model_type].get_resource_costs(rsu, sub_task)
 
-                    load_time = 0.02  # 先假设加载时间是0.02
                     mem = self.LLMModel[sub_task.model_type].precisions[sub_task.precision_req]['beta'] * self.LLMModel[sub_task.model_type].theta
-                    if mem > rsu.memory_capacity - rsu.current_memory_used:
+                    if mem_static  > rsu.memory_capacity - rsu.current_memory_used:
                         # 没有内存部署了，无法执行
-                        reward = -2
-                    else:
-                        exe_time, mem_cost = self.LLMModel[sub_task.model_type].get_resource_costs(rsu, sub_task)
+                        parent.failed = True
+                        rsu.last_exec_status = -1.0  # [记录] 严重错误：OOM
+                        reward = -5
+                    else: # 有内存 ，能部署
+                        # Rsu 已部署模型 添加上。 内存也添加上
+                        rsu.deployed_models[sub_task.model_type] = sub_task.precision_req
+                        rsu.current_memory_used += mem_static
                         total_time = exe_time + load_time
-                        mem_cost = mem_cost + mem
-
-
-                if rsu.current_memory_used + mem_cost > rsu.memory_capacity:
-                    # OOM 失败
-                    reward = -10  # 严重惩罚
-                else:
-                    # 成功执行
-                    # rsu.current_memory_used += mem_cost
-                    # total_time = exe_time  # + 传输时间 (本地忽略 V2I)
-
-                    finish_time = self.current_step  * self.dt + total_time
-                    if finish_time <= (parent.deadline - self.current_step * self.dt):
-                        rsu.stats[sub_task.model_type]['success'] += 1
-                        # 奖励 = 基础分 + 剩余时间奖励
-                        reward = 10 + (1.0 / total_time)
-                    else:
-                        reward = -2  # 超时惩罚
-                    success = True
+                        if mem_kv > rsu.memory_capacity - rsu.current_memory_used:
+                            parent.failed = True
+                            rsu.last_exec_status = -1.0  # [记录] 严重错误：OOM
+                            reward = -6
+                        else:
+                            finish_time = self.current_step * self.dt + total_time
+                            if finish_time <= (parent.deadline - self.current_step * self.dt):
+                                rsu.stats[sub_task.model_type]['success'] += 1
+                                # 奖励 = 基础分 + 剩余时间奖励
+                                # 计算类型最小完成率
+                                rate = 0
+                                for n, model in rsu.stats.items():
+                                    if model['total'] != 0:
+                                        rate_ = model['success'] / model['total']
+                                        rate = rate_ if rate_ > rate else rate
+                                    else:
+                                        rate_ = 0
+                                        rate = rate_
+                                reward = 8 + rate + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
+                                rsu.last_exec_status = 1.0  # [记录] 完美成功
+                                success = True
+                            else:
+                                parent.failed = True
+                                rsu.last_exec_status = -0.5  # [记录] 虽然做了但超时
+                                reward = -4  # 超时惩罚
 
             elif is_offload:
                 # --- 卸载逻辑 ---
                 # 先判断自身是否有邻居
-
                 # 确定目标邻居 ID
                 target_rsu_id = (rsu.id - 1) if action < 6 else (rsu.id + 1)
-                # target_rsu_id = max(0, min(target_rsu_id, self.n_rsus - 1))  # 边界处理
-
                 if target_rsu_id == -1  or target_rsu_id == 6: #没有左邻居、 没有右邻居 惩罚
+                    parent.failed = True
+                    rsu.last_exec_status = -0.3  # [记录] 无效目标
                     reward = -5
-                else:
+                else: # 有邻居
+                    rsu = self.rsus[f'Rsu_{target_rsu_id}']
+                    exe_time, mem_static, mem_kv = self.LLMModel[sub_task.model_type].get_resource_costs(rsu, sub_task)
+                    # 1.判断邻居是否已经部署
+                    if sub_task.model_type in rsu.deployed_models and rsu.deployed_models[sub_task.model_type] <= sub_task.precision_req:
+                        # 代表对应精度或者更高精度的模型已经部署，可以直接执行
+                        # 计算 RSU 间传输时延
+                        # trans_time = 0.1  # 假设光纤直连 100ms
+                        datasize = sub_task.Token_in * \
+                                   self.LLMModel[sub_task.model_type].precisions[sub_task.precision_req]['beta']
+                        trans_time = datasize / (125 * 1e6)  # 1000 M 光纤网速
+                        # 计算 cost (调用 LLMModel)
+                        total_time = exe_time + trans_time
+                        # 如果内存超了，就要惩罚
+                        if rsu.current_memory_used + mem_kv > rsu.memory_capacity:
+                            # OOM 失败 此时父任务直接失败
+                            parent.failed = True
+                            rsu.last_exec_status = -1.0  # [记录] 严重错误：OOM
+                            reward = -5  # 严重惩罚
+                        else:# 内存没超
+                            finish_time = self.current_step * self.dt + total_time
+                            if finish_time <= (parent.deadline - self.current_step * self.dt):
+                                rsu.stats[sub_task.model_type]['success'] += 1
+                                # 奖励 = 基础分 + 剩余时间奖励
+                                # 计算类型最小完成率
+                                rate = 0
+                                for n, model in rsu.stats.items():
+                                    if model['total'] != 0:
+                                        rate_ = model['success'] / model['total']
+                                        rate = rate_ if rate_ > rate else rate
+                                    else:
+                                        rate_ = 0
+                                        rate = rate_
+                                reward = 10 + rate + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
+                                rsu.last_exec_status = 1.0  # [记录] [记录] 完美成功
+                                success = True
+                            else:#超时了
+                                parent.failed = True
+                                rsu.last_exec_status = -0.5 #[记录] [记录] 虽然做了但超时
+                                reward = -4  # 超时惩罚
 
-                    # 计算 RSU 间传输时延
-                    trans_time = 0.1  # 假设光纤直连 100ms
+                    # 对应精度的模型没有部署，需要加载。
+                    else:
+                        load_time = 1.02  # 先假设加载时间是1.02
+                        if mem_static > rsu.memory_capacity - rsu.current_memory_used:
+                            # 没有内存部署了，无法执行
+                            parent.failed = True
+                            rsu.last_exec_status = -1.0  # [记录] 严重错误：OOM
+                            reward = -5
+                        else:  # 有内存 ，能部署
+                            # Rsu 已部署模型 添加上。 内存也添加上
+                            rsu.deployed_models[sub_task.model_type] = sub_task.precision_req
+                            rsu.current_memory_used += mem_static
 
-                    exe_time, mem_cost = self.LLMModel[sub_task.model_type].get_resource_costs(rsu, sub_task)
-
-                    total_time = exe_time + trans_time
-                    # ... 类似本地执行的检查逻辑，但要加上 trans_time ...
-                    finish_time = self.current_step * self.dt + total_time
-
-                    reward = 5  # 卸载成功的奖励通常略低于本地（因为占用了带宽）
-                    success = True
-
+                            datasize = sub_task.Token_in * \
+                                       self.LLMModel[sub_task.model_type].precisions[sub_task.precision_req]['beta']
+                            trans_time = datasize / (125 * 1e6)  # 1000 M 光纤网速
+                            total_time = exe_time + load_time + trans_time
+                            # 如果内存超了，就要惩罚
+                            if rsu.current_memory_used + mem_kv > rsu.memory_capacity:
+                                # OOM 失败 此时父任务直接失败
+                                parent.failed = True
+                                rsu.last_exec_status = -1.0  # [记录] 严重错误：OOM
+                                reward = -5  # 严重惩罚
+                            else:# 内存没超
+                                finish_time = self.current_step * self.dt + total_time
+                                if finish_time <= (parent.deadline - self.current_step * self.dt):
+                                    rsu.stats[sub_task.model_type]['success'] += 1
+                                    # 奖励 = 基础分 + 剩余时间奖励
+                                    # 计算类型最小完成率
+                                    rate = 0
+                                    for n, model in rsu.stats.items():
+                                        if model['total'] != 0:
+                                            rate_ = model['success'] / model['total']
+                                            rate = rate_ if rate_ > rate else rate
+                                        else:
+                                            rate_ = 0
+                                            rate = rate_
+                                    reward = 8 + rate + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
+                                    rsu.last_exec_status = 1.0  # [记录] [记录] 完美成功
+                                    success = True
+                                else:
+                                    parent.failed = True
+                                    rsu.last_exec_status = -0.5  # [记录] [记录] 虽然做了但超时
+                                    reward = -4  # 超时惩罚
             reward_n[name] = reward
-
 
             if success:
                 # 1. 更新父任务状态
                 parent.mark_subtask_done(sub_task.model_type, finish_time)
-
                 # 2. 给一点点“进度奖励” (Step Reward)
                 # 鼓励 Agent 推进任务，但不代表最终胜利
                 reward_n[name] += 1.0
-
                 # 3. 关键检查：是否所有子任务都完成了？ (All-or-Nothing)
                 if parent.is_fully_complete():
                     # --- 最终胜利结算 ---
-
                     # 计算端到端时延 (木桶效应：取决于最慢的那个)
                     total_latency = parent.get_final_latency()
 
                     if total_latency <= (parent.deadline - parent.created_time):
                         # 成功且未超时：给予巨额奖励
                         # 只有触发这个，才算这辆车的任务真正被 satisfying
-                        big_bonus = 50 + (10 / total_latency)
+                        # --- 修改为 ---:
+                        # 限制 latency 不能太小，防止除以 0.0001 导致爆炸
+                        safe_latency = max(total_latency, 0.5)
+                        big_bonus = 20 + (10.0 / safe_latency)
 
+                        # 并且做一个截断，防止偶尔的超大值
+                        big_bonus = min(big_bonus, 50.0)
                         # 问题：这个奖励给谁？
                         # 方案1：给当前完成最后一步的 RSU (简单)
                         # 方案2：广播给所有参与过该父任务的 RSU (更符合协作精神，但难实现)
@@ -325,12 +423,13 @@ class Environment(gym.Env):
                         # self._update_fairness_stats(parent)
                     else:
                         # 虽然做完了但整体超时
-                        reward_n[name] -= 5
+                        reward_n[name] -= 4
             else:
                 # 子任务失败 (OOM 或单体超时)
                 parent.failed = True
                 parent.sub_task_status[sub_task.model_type] = 'failed'
                 reward_n[name] -= 20  # 严重惩罚，因为搞砸了整个父任务
+
         # --- Phase 2: 全局公平性修正 (Fairness) ---
         # 你的论文核心: max min g_m
         # 计算所有任务类型的完成率
@@ -357,7 +456,11 @@ class Environment(gym.Env):
         # --- Phase 3: 环境更新 ---
         for name, v in self.vehicles.items():
             self._update_vehicles(v)
-            self._generate_new_request(v)
+            if v.x > 1000:
+                del self.vehicles[name]
+                self.determine_vehicle_ownership()
+            else:
+                self._generate_new_request(v)
         self.current_step += 1
 
         if self.current_step >= self.max_steps:
@@ -424,9 +527,15 @@ class Environment(gym.Env):
             precision_req_list.append(prec)
 
         # 3. 生成截止时间 (Deadline)
-        # 任务越复杂 (Token多)，给的容忍时间通常稍微宽裕一点，但也有随机扰动
-        # 基础容忍时间 0.5s ~ 3.0s
-        tolerance = np.random.uniform(0.5, 3.0)
+        # --- 优化后的 Deadline 生成逻辑 ---
+        # 基础时间：每个模型给 0.5 ~ 1.0 秒的预算
+        # 如果是 1 个模型，deadline 就是 0.5~1.0s
+        # 如果是 3 个模型，deadline 就是 1.5~3.0s (给它更多时间)
+        base_time_per_model = np.random.uniform(0.5, 1.0)
+        tolerance = base_time_per_model * len(selected_models)
+        # 加上一点随机扰动 (0 ~ 0.5s)
+        tolerance += np.random.uniform(0, 0.5)
+
         deadline = self.current_step * self.dt + tolerance
 
         # 4. 打包所需信息字典 (对应 Image 2 的格式)
@@ -454,25 +563,6 @@ class Environment(gym.Env):
         for name, sub_task in parent_task.sub_tasks.items():
             nearest_rsu.task_queue.append(sub_task)
 
-        # if nearest_rsu:
-        #     # 遍历生成的模型列表，拆解为子任务
-        #     for idx, model_type in enumerate(selected_models):
-        #         sub_task = {
-        #             'parent_id': task_id,
-        #             'vehicle_id': vehicle.id,
-        #             'model_type': model_type,
-        #             'input_tokens': token_in_list[idx],
-        #             'output_tokens': token_out_list[idx],
-        #             'req_precision': precision_req_list[idx],  # 记录原始需求
-        #             'deadline': deadline,
-        #             'cot_paths': cot_paths if 'llama' in model_type else 1,
-        #             'timestamp': self.current_step * self.dt
-        #         }
-        #         nearest_rsu.task_queue.append(sub_task)
-
-        # return task_id
-
-
 
     def _calc_jains_index(self, rates):
         # Jain's Fairness Index 公式
@@ -480,9 +570,6 @@ class Environment(gym.Env):
         if np.sum(rates) == 0: return 0
         return (np.sum(rates) ** 2) / (len(rates) * np.sum(rates ** 2))
 
-    def _map_model_id(self, name):
-        mapping = {'llama-8b': 1, 'vit-image': 2, 'point-lidar': 3, 'radar-former': 4}
-        return mapping.get(name, 0)
 
     def _find_nearest_rsu(self, vehicle):
         """
@@ -538,3 +625,8 @@ class Environment(gym.Env):
         rate = bandwidth * np.log2(1 + snr)
 
         return rate  # 单位: bits per second (bps)
+
+    def _map_model_id(self,name):
+        mapping = {'llama-8b': [1, 0, 0, 0], 'vit-image': [0, 1, 0, 0], 'point-lidar': [0, 0, 1, 0],
+                   'radar-former': [0, 0, 0, 1]}
+        return mapping.get(name, 0)

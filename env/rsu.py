@@ -24,6 +24,8 @@ class Rsu:
         # 统计数据 (用于计算公平性 g_m)
         self.stats = {m: {'success': 0, 'total': 0} for m in ['llama-8b', 'vit-image', 'point-lidar', 'radar-former']}
 
+        self.last_exec_status = 0.0
+
     def add_vehicle(self, vehicle):
 
         for i, value in enumerate(self.vehicles):
