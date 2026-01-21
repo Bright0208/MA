@@ -10,6 +10,7 @@ class Vehicle:
         self.z = config['z']
         self.speed = config['speed']
         self.tx_power = config['tx_power']
+        self.is_leave = False
 
     def move(self):
         self.x += self.speed

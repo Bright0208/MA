@@ -25,6 +25,7 @@ class Rsu:
         self.stats = {m: {'success': 0, 'total': 0} for m in ['llama-8b', 'vit-image', 'point-lidar', 'radar-former']}
 
         self.last_exec_status = 0.0
+        self.model_last_access ={}   # LRU 记录器: {模型名: 上次访问step}
 
     def add_vehicle(self, vehicle):
 

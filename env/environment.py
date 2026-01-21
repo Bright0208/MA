@@ -30,7 +30,7 @@ class Environment(gym.Env):
         #   3-5: 卸载给左邻居 (精度 k=1, 2, 3)
         #   6-8: 卸载给右邻居 (精度 k=1, 2, 3)
         #   9: 拒绝任务 (Drop)
-        self.n_actions = 10
+        self.n_actions = 22
         self.action_space = spaces.Discrete(self.n_actions)
 
         # --- 3. 观测空间 (Observation Space) ---
@@ -38,6 +38,15 @@ class Environment(gym.Env):
         self.obs_dim = 12  # 简单示例: 11维
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.obs_dim,), dtype=np.float32)
 
+        # 辅助映射：动作 ID -> (模型名, 精度)
+        self.deploy_action_map = {}
+        model_names = ['llama-8b', 'vit-image', 'point-lidar', 'radar-former']
+        # 10~21
+        idx = 10
+        for m_name in model_names:
+            for prec in [1, 2, 3]:  # 1:FP16, 2:INT8, 3:INT4
+                self.deploy_action_map[idx] = (m_name, prec)
+                idx += 1
 
     def determine_vehicle_ownership(self):
         for r_name, rsu in self.rsus.items():
@@ -74,7 +83,7 @@ class Environment(gym.Env):
             rsu.task_queue = []  # 清空等待队列
             # [新增] 初始化上一步状态记录 (0 表示无事发生)
             rsu.last_exec_status = 0.0
-
+            rsu.model_last_access = {}  # LRU 记录器: {模型名: 上次访问step}
             # 重置统计数据 (用于计算这一轮 Episode 的公平性)
             for m in rsu.stats:
                 rsu.stats[m] = {'success': 0, 'total': 0}
@@ -120,6 +129,8 @@ class Environment(gym.Env):
                     # print("没部署模型",task.model_type)
                 #与车辆之间的链路状态，还有车辆是靠近自己还是远离自己
                 parent_task = self.task_registry.get(task.parent_id)
+                # print("parent_id:", task.parent_id)
+                # print("parent_task:", parent_task)
                 # print("parent_task:",parent_task.vehicle_id)
                 vehicle = self.vehicles.get(f"V_{parent_task.vehicle_id}")
                 rate = self._calculate_transmission_rate(vehicle,rsu)
@@ -147,11 +158,110 @@ class Environment(gym.Env):
 
         return obs_n
 
+    def _perform_deployment(self, rsu, model_name, target_precision):
+        """
+        [新增] 主动部署/替换模型逻辑 (带 LRU 淘汰)
+        返回: (success, cost_time)
+        """
+        # 1. 检查是否完全一致 (模型+精度都一样) -> Hot Start
+        if model_name in rsu.deployed_models:
+            current_prec = rsu.deployed_models[model_name]
+            # 如果精度也一样，那就是纯粹的刷新缓存
+            if current_prec == target_precision:
+                rsu.model_last_access[model_name] = self.current_step
+                return True, 0.1  # 极小耗时
+
+            # 如果模型一样但精度不一样 (例如 INT8 -> FP16)，视为重新加载
+            # 先卸载旧的，腾出空间
+            old_conf = self.LLMModel[model_name]
+            old_mem = old_conf.precisions[current_prec]['beta'] * old_conf.theta
+            rsu.current_memory_used -= old_mem
+            del rsu.deployed_models[model_name]
+            # (继续往下走加载流程)
+
+        # 2. 计算新模型所需内存
+        model_conf = self.LLMModel[model_name]
+        needed_mem = model_conf.precisions[target_precision]['beta'] * model_conf.theta
+
+        # 加载时间惩罚 (模拟从磁盘读入显存)
+        # 精度越高模型越大，加载越慢 (这里简化为固定 1.0s，也可以改成跟 beta 相关)
+        load_time = 1.0
+
+        # 3. 内存不足？触发 LRU 淘汰
+        # 防止死循环：如果删光了都不够，那就只能失败
+        while (rsu.memory_capacity - rsu.current_memory_used) < needed_mem:
+            if len(rsu.deployed_models) == 0:
+                # 显存确实不够放这个模型 (物理上限)
+                return False, 0.1
+
+                # 找到最久没用的模型 (LRU)
+            # 排除掉自己 (虽然还没部署进去，但逻辑上不该删自己，这里因为已经del了旧的所以没事)
+            lru_model = min(rsu.model_last_access, key=rsu.model_last_access.get)
+
+            # 执行卸载
+            old_p = rsu.deployed_models[lru_model]
+            old_c = self.LLMModel[lru_model]
+            freed_mem = old_c['precisions'][old_p]['beta'] * old_c['theta']
+
+            del rsu.deployed_models[lru_model]
+            del rsu.model_last_access[lru_model]
+            rsu.current_memory_used -= freed_mem
+
+            # print(f"DEBUG: RSU {rsu.id} LRU Eviction -> {lru_model}")
+
+        # 4. 部署新模型
+        rsu.deployed_models[model_name] = target_precision
+        rsu.model_last_access[model_name] = self.current_step
+        rsu.current_memory_used += needed_mem
+
+        return True, load_time
+
+    def step_deploy(self,action_dict):
+        """
+        [慢速层] 执行部署动作
+        deploy_actions: 字典 {Rsu_0: 0~11, ...}
+        对应之前的动作 10-21 (现在映射为 0-11)
+        """
+        # 1. 映射动作 ID (0-11 -> 模型+精度)
+        # 0-2: Llama, 3-5: ViT, 6-8: Lidar, 9-11: Radar
+        idx = 0
+        deploy_map = {}
+        model_names = ['llama-8b', 'vit-image', 'point-lidar', 'radar-former']
+        for m in model_names:
+            for p in [1, 2, 3]:
+                deploy_map[idx] = (m, p)
+                idx += 1
+
+        deploy_infos = {}  # 记录部署产生的开销
+        for name, action_index in action_dict.items():
+            rsu = self.rsus[name]
+            # 解析动作
+            if isinstance(action_index, np.ndarray):
+                action = np.argmax(action_index)
+            else:
+                action = int(action_index)
+            target_model, target_prec = deploy_map[action]
+            success, cost_time = self._perform_deployment(rsu, target_model, target_prec)
+            deploy_infos[name] = {
+                'cost_time': cost_time,
+                'success': success
+            }
+            # 记录状态
+            if success:
+                rsu.last_exec_status = 0.5  # 部署中
+            else:
+                rsu.last_exec_status = -0.2
+
+        # 返回部署后的观测 (给慢智能体存Buffer用)
+        return self._get_all_observations(), deploy_infos
+
     def step(self, actions_dict):
         """
         核心循环: 执行动作 -> 计算时延 -> 计算 Reward
         actions: list of action indices, e.g., [2, 9, 3] 对应 3 个 RSU 的决策
+        [22维动作空间版] 核心 Step 函数
         """
+
         # 初始化 要记录的信息
         reward_n = {}
         done_n = {}
@@ -161,9 +271,9 @@ class Environment(gym.Env):
             done_n[name] = False
             info[name] = {}
 
-
         # --- Phase 1: 执行每个 RSU 的决策 ---
         for name, action_index in actions_dict.items():   #actions 是列表，不合适，应该也是字典
+            rsu = self.rsus[name]
 
             # 将10维的动作 argmax 变成一维的动作
             if isinstance(action_index, np.ndarray):
@@ -171,15 +281,48 @@ class Environment(gym.Env):
             else:
                 action = action_index  # 防止已经是int的情况
 
+            # === 判断动作类型 ===
             # 将动作解码
             is_local = action < 3        #本地0高 1中 2低 精度执行
             is_offload = 3 <= action < 9   #左邻居 3高 4中 5低    右邻居 6高 7中 8低
             is_drop = action == 9          #丢弃 无法执行
+
             precision = (action % 3) + 1  # k=1,2,3
+            is_service_deploy = action >= 10  # 10-21 是部署
 
-            rsu = self.rsus[name]
+            # =======================================================
+            # 分支 A: 主动服务部署 (Action 10-21)
+            # =======================================================
+            if is_service_deploy:
+                # 1. 解析目标模型和精度
+                target_model_name, target_prec = self.deploy_action_map[action]
 
-            # print("此时的Rsu是：",rsu.id,"此时的动作是：",action)
+                # 2. 执行部署 (含 LRU)
+                success, cost_time = self._perform_deployment(rsu, target_model_name, target_prec)
+
+                if success:
+                    rsu.last_exec_status = 0.5  # 状态码：0.5 表示正在部署/调整
+                    # [奖励设计]
+                    # 部署是有成本的！给予负奖励防止 Agent 频繁抖动
+                    # 如果是 Hot Start (0.1s)，惩罚很小；如果是 Cold Start (1.0s)，惩罚大
+                    reward = -5.0 * cost_time
+
+                    # [阻塞惩罚]
+                    # 如果此时队列里有任务，它们被阻塞了！Agent 应该在空闲时做这个
+                    if len(rsu.task_queue) > 0:
+                        reward -= 2.0
+                else:
+                    # 部署失败 (物理显存不足等极端情况)
+                    reward = -5.0
+                    rsu.last_exec_status = -0.2
+
+                reward_n[name] = reward
+                # 部署占用了一个时间步，跳过任务处理
+                continue
+
+                # =======================================================
+            # 分支 B: 任务处理 (Action 0-9)
+            # =======================================================
 
             # 这个Rsu这一次动作的Reward
             reward = 0
@@ -188,7 +331,9 @@ class Environment(gym.Env):
 
             # 如果队列为空，动作无效，给予小惩罚鼓励空闲时休眠或预取
             if len(rsu.task_queue) == 0:
-                reward_n[name] = 0.1
+                # 队列为空，但 Agent 选择了处理任务 (0-9)
+                # 这是一种“浪费”，因为它本可以用来部署 (10-21) 或者休眠
+                reward_n[name] = 0.0
                 # print("队列为空，跳出循环")
                 rsu.last_exec_status = 0.1  # [记录] 空闲
                 continue
@@ -199,6 +344,13 @@ class Environment(gym.Env):
             #找到子任务的父任务
             parent_id = sub_task.parent_id
             parent = self.task_registry[parent_id]  # 获取父任务对象
+            # 给这类服务的总数加一，准备执行这个任务了
+            rsu.stats[sub_task.model_type]['total'] += 1
+
+            # [LRU 更新] 只要任务在队列里被处理了，该模型的"最后访问时间"就刷新
+            # 注意：这里我们假设只要试图处理，就说明该模型是有用的
+            rsu.model_last_access[sub_task.model_type] = self.current_step
+
 
             # 如果父任务之前已经有别的子任务失败了，这个子任务就没必要做了（剪枝）
             if parent.failed:
@@ -207,13 +359,11 @@ class Environment(gym.Env):
                 continue
 
 
-            # 给这类服务的总数加一，准备执行这个任务了
-            rsu.stats[sub_task.model_type]['total'] += 1
-
             #判断动作，如果是丢弃
             if is_drop: # 丢弃，不执行，此时父任务直接失败
                 # 拒绝惩罚
                 parent.failed = True
+                parent.sub_task_status[sub_task.model_type] = 'failed'
                 rsu.last_exec_status = -0.2  # [记录] 主动丢弃
                 reward = -10
 
@@ -436,7 +586,6 @@ class Environment(gym.Env):
         global_stats = {}  # 聚合所有 RSU 的统计
         completion_rates = []
         for name, rsu in self.rsus.items():
-
             for m_type, dat in rsu.stats.items():
                 if dat['total'] > 0:
                     rate = dat['success'] / dat['total']
@@ -454,11 +603,21 @@ class Environment(gym.Env):
                 reward_n[name] = r + fairness_bonus
 
         # --- Phase 3: 环境更新 ---
+        # [修改] 加上 list(...)，创建副本进行遍历
         for name, v in self.vehicles.items():
             self._update_vehicles(v)
             if v.x > 1000:
-                del self.vehicles[name]
-                self.determine_vehicle_ownership()
+                v.is_leave = True
+                # print('这个车辆离开范围了',name)
+                # del self.vehicles[name]
+                # print('在环境里面把它给删除了',name)
+                # for name_ ,parent_task in list(self.task_registry.items()):
+                #     if parent_task.vehicle_id == v.id:
+                #         print('它对应的父任务是', name_)
+                #         del self.task_registry[parent_task.task_id]
+                # 注意：在这里频繁调用这个函数可能会有点慢，
+                # 如果车辆很多，建议把这一行移到循环外面执行一次
+                # self.determine_vehicle_ownership()
             else:
                 self._generate_new_request(v)
         self.current_step += 1

@@ -15,7 +15,7 @@ class MADDPG:
 
         # 设备配置
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        print("Using {} device".format(self.device))
         # 初始化每个 Agent 的网络
         for i in range(n_agents):
             # 每个 Agent 都有自己的 Actor 和 Critic

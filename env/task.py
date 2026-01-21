@@ -33,6 +33,7 @@ class ParentTask:
         # 标记是否失败 (只要有一个子任务失败，整个大任务就失败)
         self.failed = False
 
+
     def mark_subtask_done(self, model_name, finish_time):
         self.sub_task_status[model_name] = 'success'
         self.finish_times[model_name] = finish_time
