@@ -5,7 +5,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import datetime
 from env.environment import Environment
-from config import device, MODELS_CONFIG, RSU_CONFIGS, Vehicle_CONFIGS
+from config import device, MODELS_CONFIG, RSU_CONFIGS
 from env.llm_model import LLMModel
 from env.rsu import Rsu
 from env.vehicle import Vehicle
@@ -20,12 +20,13 @@ if __name__ == "__main__":
     model_library = {name: LLMModel(name, conf) for name, conf in MODELS_CONFIG.items()}
     # 实例化RSU
     Rsu_dict = {name: Rsu(conf) for name, conf in RSU_CONFIGS.items()}
-    # TODO ：构建邻居
-    # 实例化车辆
-    Vehicle_dict = {name: Vehicle(conf) for name, conf in Vehicle_CONFIGS.items()}
 
-    env = Environment(model_library, Rsu_dict, Vehicle_dict)
-    env.determine_vehicle_ownership()
+    # TODo 后面要改成随机初始化车辆
+    # 实例化车辆
+    # Vehicle_dict = {name: Vehicle(conf) for name, conf in Vehicle_CONFIGS.items()}
+
+    env = Environment(model_library, Rsu_dict)
+    env.reset(seed=42)
 
     n_agent = env.get_agent_numbers()  # 获得智能体数量
     state_dim = env.get_state_dim()  # 通过state获得state_dim
@@ -40,8 +41,8 @@ if __name__ == "__main__":
     maddpg_task = MADDPG(n_agent, state_dim, dim_act=10, batch_size=256)
     buffer_task = ReplayBuffer(capacity=100000)
 
-    DEPLOY_INTERVAL = 50  # 时间尺度 K
-    MAX_EPISODES = 5000
+    DEPLOY_INTERVAL = 20  # 时间尺度 K
+    MAX_EPISODES = 800
 
     # ... (初始化) ...
     # === 1. 新增记录列表 ===
@@ -64,7 +65,7 @@ if __name__ == "__main__":
 
         # 统计变量
         episode_reward = 0
-
+        episode_reward_dict = {f'Rsu_{i}': 0.0 for i in range(n_agent)}
         # --- 慢智能体 状态记录 ---
         deploy_obs = obs_n  # 记录 K 步开始时的状态 (S_slow)
         deploy_actions = None  # 记录 K 步开始时的动作 (A_slow)
@@ -115,7 +116,7 @@ if __name__ == "__main__":
                 # 我们给慢智能体一个负奖励，防止它频繁乱动
                 for key in agent_ids:
                     info = deploy_infos.get(key, {'cost_time': 0})
-                    cost_penalty = -2.0 * info['cost_time']  # 这里的系数可以调
+                    cost_penalty = -1.0 * info['cost_time']  # 这里的系数可以调
                     interval_rewards[key] = cost_penalty
 
             # ==========================================
@@ -124,7 +125,7 @@ if __name__ == "__main__":
             # 1. 选择动作
             actions_n = maddpg_task.select_action(obs_n)
 
-            next_obs_n, reward_n, done_n, _ = env.step(actions_n)
+            next_obs_n, reward_n, done_n, info_rate = env.step(actions_n)
 
             # print("obs_n:",obs_n)
             # print("actions_n:",actions_n)
@@ -157,6 +158,7 @@ if __name__ == "__main__":
             for name, reward_ in reward_n.items():
                 interval_rewards[name] += reward_
                 episode_reward += reward_
+                episode_reward_dict[name] += reward_
 
             obs_n = next_obs_n
 
@@ -179,6 +181,8 @@ if __name__ == "__main__":
             act_list_d = [deploy_actions[key] for key in agent_ids]
             # 最后一步的 next_obs
             next_obs_list_d = [obs_n[key] for key in agent_ids]
+            # [!!! 必须补上这一行 !!!] 计算最后一段的累积奖励
+            rew_list_d = [interval_rewards[key] for key in agent_ids]
             # 这里可以算 True Done
             done_list_d = [True for _ in agent_ids]
             buffer_deploy.push(obs_list_d, act_list_d, rew_list_d, next_obs_list_d, done_list_d)
@@ -186,7 +190,9 @@ if __name__ == "__main__":
         # Logging: 记录数据到 TensorBoard
         # =========================================================
         # 1. Main Reward
-        writer.add_scalar('Main/Total_Reward', episode_reward, episode)
+        writer.add_scalar('Main/Total_Reward_mean', np.mean(all_ep_rewards), episode)
+        writer.add_scalar('Main/Total_Reward', episode_reward/200, episode)
+        writer.add_scalars('Main/Episode_Reward', interval_rewards, episode)
         # 2. Task Agent Losses
         if len(task_c_losses) > 0:
             writer.add_scalar('Loss_Task/Critic', np.mean(task_c_losses), episode)
@@ -196,26 +202,44 @@ if __name__ == "__main__":
             writer.add_scalar('Loss_Deploy/Critic', np.mean(deploy_c_losses), episode)
             writer.add_scalar('Loss_Deploy/Actor', np.mean(deploy_a_losses), episode)
         # 4. Fairness Metrics (最小完成率)
-        rsu_rates = []
+        rsu_worst_model_rates = []
+        # 详细记录用于 Debug (可选)
+        detailed_stats = {}
         for r_name, rsu in env.rsus.items():
-            total_tasks = sum([m['total'] for m in rsu.stats.values()])
-            total_success = sum([m['success'] for m in rsu.stats.values()])
-            rate = total_success / total_tasks if total_tasks > 0 else 0.0
-            rsu_rates.append(rate)
-        min_rate = min(rsu_rates) if len(rsu_rates) > 0 else 0.0
+            # 临时存该 RSU 4个模型的完成率
+            current_rsu_model_rates = []
+            # 获取统计数据 (注意：stats[m_name] 已经包含了所有精度)
+            # 1. 定义 4 种模型类型 (确保这些 Key 和你 env 里的一致)
+            for key in model_library.keys():
+                stats = rsu.stats.get(key, {'success': 0, 'total': 0})
+                success = stats['success']
+                total = stats['total']
+                if total > 0:
+                    rate = success / total
+                else:
+                    # [策略] 如果这个模型从来没来过任务，算 1.0 (完美) 还是 0.0 (未服务)？
+                    # 建议：如果没任务，就不应该拖后腿，设为 1.0 (无过错)。
+                    # 这样 min() 函数才会去抓那些真的 total>0 但 success很低 的模型。
+                    rate = 1.0
+                current_rsu_model_rates.append(rate)
+            # 2. 找到该 RSU 内部的短板 (例如：Llama 只有 20%，其他都 100%，那就是 0.2)
+            worst_rate_in_this_rsu = min(current_rsu_model_rates)
+            rsu_worst_model_rates.append(worst_rate_in_this_rsu)
+            # (可选) 记录一下方便看
+            detailed_stats[r_name] = worst_rate_in_this_rsu
+        # 3. 找到整个系统的"最短板" (所有 RSU 短板里的最小值)
+        # 这就是你要"最大化"的目标
+        system_min_model_rate = min(rsu_worst_model_rates) if len(rsu_worst_model_rates) > 0 else 0.0
+        writer.add_scalar('Fairness/System_Worst_Model_Rate', system_min_model_rate, episode)
+        # 指标 2: 系统的平均短板 (看整体水平)
+        avg_worst_rate = np.mean(rsu_worst_model_rates)
+        writer.add_scalar('Fairness/Average_Worst_Model_Rate', avg_worst_rate, episode)
+        # 3
+        writer.add_scalars('Fairness/detailed_stats', detailed_stats, episode)
 
-        # # Jain's Index
-        # rates_arr = np.array(rsu_rates)
-        # if np.sum(rates_arr ** 2) == 0:
-        #     jains = 0.0
-        # else:
-        #     jains = (np.sum(rates_arr) ** 2) / (len(rates_arr) * np.sum(rates_arr ** 2))
-
-        writer.add_scalar('Fairness/Min_Rate', min_rate, episode)
-        # writer.add_scalar('Fairness/Jains_Index', jains, episode)
 
         print(
-            f"Ep {episode}: Reward={episode_reward:.2f} | MinRate={min_rate:.2f} | TaskLoss={np.mean(task_c_losses) if task_c_losses else 0:.2f}")
+            f"Ep {episode}: Reward={episode_reward:.2f} | MinRate={system_min_model_rate:.2f} | TaskLoss={np.mean(task_c_losses) if task_c_losses else 0:.2f}")
 
         # =========================================================
         # Save Models (Every 100 episodes)

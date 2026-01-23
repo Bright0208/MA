@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -110,110 +111,37 @@ RSU_CONFIGS = {
 }
 
 # 模拟不同车辆的配置
-Vehicle_CONFIGS = {
-    'V_0': {
-        'id':0, 'x':0, 'y':0, 'z':1.5, 'speed':4,'tx_power':0.5
-    },
-    'V_1': {
-        'id': 1, 'x': 10, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_2': {
-        'id': 2, 'x': 30, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_3': {
-        'id': 3, 'x': 50, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_4': {
-        'id': 4, 'x': 60, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_5': {
-        'id': 5, 'x': 100, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_6': {
-        'id': 6, 'x': 120, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_7': {
-        'id': 7, 'x': 150, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_8': {
-        'id': 8, 'x': 180, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_9': {
-        'id': 9, 'x': 200, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_10': {
-        'id': 10, 'x': 250, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_11': {
-        'id': 11, 'x': 300, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_12': {
-        'id': 12, 'x': 320, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_13': {
-        'id': 13, 'x': 350, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_14': {
-        'id': 14, 'x': 380, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_15': {
-        'id': 15, 'x': 400, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_16': {
-        'id': 16, 'x': 420, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_17': {
-        'id': 17, 'x': 480, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_18': {
-        'id': 18, 'x': 510, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_19': {
-        'id': 19, 'x': 550, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_20': {
-        'id': 20, 'x': 600, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_21': {
-        'id': 21, 'x': 650, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_22': {
-        'id': 22, 'x': 670, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_23': {
-        'id': 23, 'x': 690, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_24': {
-        'id': 24, 'x': 700, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_25': {
-        'id': 25, 'x': 720, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_26': {
-        'id': 26, 'x': 750, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_27': {
-        'id': 27, 'x': 780, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_28': {
-        'id': 28, 'x': 800, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_29': {
-        'id': 29, 'x': 810, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_30': {
-        'id': 30, 'x': 850, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_31': {
-        'id': 31, 'x': 860, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_32': {
-        'id': 32, 'x': 900, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_33': {
-        'id': 33, 'x': 910, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-    'V_34': {
-        'id': 34, 'x': 950, 'y': 0, 'z': 1.5, 'speed': 4,'tx_power':0.5
-    },
-}
+# --- 车辆生成配置 ---
+NUM_VEHICLES = 30  # 你想要多少辆车
+ROAD_LENGTH = 1000  # 道路长度 (米)
+MIN_SPEED = 1.0  # 最小速度 (m/s)
+MAX_SPEED = 4.0  # 最大速度 (m/s)
+
+
+def generate_random_vehicle_configs(num_vehicles=NUM_VEHICLES):
+    """
+    随机生成车辆配置字典
+    """
+    configs = {}
+    for i in range(num_vehicles):
+        v_id = f"V_{i}"
+
+        # 随机位置 (0 到 1000米之间)
+        random_x = np.random.uniform(0, ROAD_LENGTH)
+
+        # 随机速度 (5 到 20 m/s)
+        random_speed = np.random.uniform(MIN_SPEED, MAX_SPEED)
+
+        # 随机方向 (可选：目前假设都向右走，速度为正)
+        # 如果需要双向车道，可以随机把 speed 设为负数
+
+        configs[v_id] = {
+            'id': i,
+            'x': random_x,
+            'y': 0,  # 假设单车道，y=0
+            'z': 1.5,
+            'speed': random_speed,
+            'tx_power': 0.5,
+            # 可以添加更多随机属性，例如车辆类型偏好等
+        }
+    return configs

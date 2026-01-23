@@ -3,7 +3,7 @@ import numpy as np
 from gymnasium import spaces
 import math
 
-from config import Vehicle_CONFIGS
+from config import  generate_random_vehicle_configs
 from env.task import ParentTask
 from env.vehicle import Vehicle
 
@@ -12,11 +12,12 @@ from env.vehicle import Vehicle
 
 
 class Environment(gym.Env):
-    def __init__(self,Model,Rsu,Vehicle):
+    def __init__(self,Model,Rsu):
         super(Environment, self).__init__()
         # --- 1. 环境配置 ---
         self.rsus = Rsu
-        self.vehicles = Vehicle
+        # 初始化一个空字典，具体车辆在 reset 里生成
+        self.vehicles = {}
         self.LLMModel  = Model
         self.dt = 0.1  # 仿真步长 (秒)
         self.current_step = 0
@@ -76,6 +77,10 @@ class Environment(gym.Env):
         self.current_step = 0
         self.task_registry = {}  # 关键！清空之前的任务记录，防止内存泄漏和ID冲突
 
+        # [新增] 随机预部署 (Pre-load)
+        # 让每个 RSU 开局就随机装载 1-2 个模型
+        model_names = ['llama-8b', 'vit-image', 'point-lidar', 'radar-former']
+
         # 3. 重置所有 RSU 的内部状态
         for name, rsu in self.rsus.items():
             rsu.current_memory_used = 0
@@ -88,10 +93,30 @@ class Environment(gym.Env):
             for m in rsu.stats:
                 rsu.stats[m] = {'success': 0, 'total': 0}
 
+            # 随机选 2 个模型
+            init_models = np.random.choice(model_names, 2, replace=False)
+            for m_name in init_models:
+                # 随机精度
+                prec = np.random.randint(1, 4)
+                # 强制部署 (不计成本，直接写内存)
+                # 注意检查一下内存防止溢出，或者简单粗暴地直接写
+                self._perform_deployment(rsu, m_name, prec)
+
         # 4. 重置车辆 (重新生成一波新的车流)
-        self.vehicles = {name : Vehicle(conf) for name, conf in Vehicle_CONFIGS.items()}
+        # A. 生成随机配置
+        new_configs = generate_random_vehicle_configs()
+
+        # B. 实例化车辆对象
+        self.vehicles = {}
+        for v_name, conf in new_configs.items():
+            self.vehicles[v_name] = Vehicle(conf)
+
+        # C. 既然有了新车，马上生成初始请求 (可选)
+        # 这样一开始 RSU 就有活干，不用等几秒
         for v_name, vehicle in self.vehicles.items():
             self._generate_new_request(vehicle)
+        # D. 重新计算归属关系
+        self.determine_vehicle_ownership()
 
         # 6. 生成并返回第一个观测值
         # 注意: 这里只返回 obs，不返回 info (旧版 Gym API)
@@ -169,7 +194,7 @@ class Environment(gym.Env):
             # 如果精度也一样，那就是纯粹的刷新缓存
             if current_prec == target_precision:
                 rsu.model_last_access[model_name] = self.current_step
-                return True, 0.1  # 极小耗时
+                return True, 0.01  # 极小耗时
 
             # 如果模型一样但精度不一样 (例如 INT8 -> FP16)，视为重新加载
             # 先卸载旧的，腾出空间
@@ -185,14 +210,14 @@ class Environment(gym.Env):
 
         # 加载时间惩罚 (模拟从磁盘读入显存)
         # 精度越高模型越大，加载越慢 (这里简化为固定 1.0s，也可以改成跟 beta 相关)
-        load_time = 1.0
+        load_time = 0.5
 
         # 3. 内存不足？触发 LRU 淘汰
         # 防止死循环：如果删光了都不够，那就只能失败
         while (rsu.memory_capacity - rsu.current_memory_used) < needed_mem:
             if len(rsu.deployed_models) == 0:
                 # 显存确实不够放这个模型 (物理上限)
-                return False, 0.1
+                return False, 0.01
 
                 # 找到最久没用的模型 (LRU)
             # 排除掉自己 (虽然还没部署进去，但逻辑上不该删自己，这里因为已经del了旧的所以没事)
@@ -265,11 +290,11 @@ class Environment(gym.Env):
         # 初始化 要记录的信息
         reward_n = {}
         done_n = {}
-        info = {}
+        info = {} #传回去的是最小完成率
         for name, rsu in self.rsus.items():
             reward_n[name] = 0  # 每一个RSU（Agent） 的奖励
             done_n[name] = False
-            info[name] = {}
+            info[name] = 1
 
         # --- Phase 1: 执行每个 RSU 的决策 ---
         for name, action_index in actions_dict.items():   #actions 是列表，不合适，应该也是字典
@@ -288,41 +313,6 @@ class Environment(gym.Env):
             is_drop = action == 9          #丢弃 无法执行
 
             precision = (action % 3) + 1  # k=1,2,3
-            is_service_deploy = action >= 10  # 10-21 是部署
-
-            # =======================================================
-            # 分支 A: 主动服务部署 (Action 10-21)
-            # =======================================================
-            if is_service_deploy:
-                # 1. 解析目标模型和精度
-                target_model_name, target_prec = self.deploy_action_map[action]
-
-                # 2. 执行部署 (含 LRU)
-                success, cost_time = self._perform_deployment(rsu, target_model_name, target_prec)
-
-                if success:
-                    rsu.last_exec_status = 0.5  # 状态码：0.5 表示正在部署/调整
-                    # [奖励设计]
-                    # 部署是有成本的！给予负奖励防止 Agent 频繁抖动
-                    # 如果是 Hot Start (0.1s)，惩罚很小；如果是 Cold Start (1.0s)，惩罚大
-                    reward = -5.0 * cost_time
-
-                    # [阻塞惩罚]
-                    # 如果此时队列里有任务，它们被阻塞了！Agent 应该在空闲时做这个
-                    if len(rsu.task_queue) > 0:
-                        reward -= 2.0
-                else:
-                    # 部署失败 (物理显存不足等极端情况)
-                    reward = -5.0
-                    rsu.last_exec_status = -0.2
-
-                reward_n[name] = reward
-                # 部署占用了一个时间步，跳过任务处理
-                continue
-
-                # =======================================================
-            # 分支 B: 任务处理 (Action 0-9)
-            # =======================================================
 
             # 这个Rsu这一次动作的Reward
             reward = 0
@@ -351,13 +341,13 @@ class Environment(gym.Env):
             # 注意：这里我们假设只要试图处理，就说明该模型是有用的
             rsu.model_last_access[sub_task.model_type] = self.current_step
 
+            load_time = 0.5  # 先假设加载时间是1.02
 
             # 如果父任务之前已经有别的子任务失败了，这个子任务就没必要做了（剪枝）
             if parent.failed:
                 reward_n[name] -= 0.2  # 或者给一点微小的负分，惩罚资源浪费
                 rsu.last_exec_status = 0.2  # [记录] 不用做
                 continue
-
 
             #判断动作，如果是丢弃
             if is_drop: # 丢弃，不执行，此时父任务直接失败
@@ -386,16 +376,16 @@ class Environment(gym.Env):
                         if finish_time <= (parent.deadline - self.current_step * self.dt):
                             rsu.stats[sub_task.model_type]['success'] += 1
                             # 奖励 = 基础分 + 剩余时间奖励
-                            # 计算类型最小完成率
-                            rate = 0
+                            # 计算该 RSU 内部 4 种模型的完成率
+                            rates = []
                             for n, model in rsu.stats.items():
-                                if model['total'] != 0:
-                                    rate_ = model['success'] / model['total']
-                                    rate = rate_ if rate_ > rate else rate
-                                else:
-                                    rate_ = 0
-                                    rate = rate_
-                            reward = 10 + rate + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
+                                s = model['success']
+                                t = model['total']
+                                rates.append(s / t if t > 0 else 1.0)
+                            # 1. 找出短板
+                            min_rate = min(rates)
+                            info[name] = min_rate
+                            reward = 10 + ((min_rate - 0.5) * 5) + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
                             rsu.last_exec_status = 1.0  # [记录] 完美成功
                             success = True
                         else:
@@ -405,7 +395,6 @@ class Environment(gym.Env):
 
                 # 对应精度的模型没有部署，需要加载。
                 else:
-                    load_time = 1.00  # 先假设加载时间是1.02
                     exe_time, mem_static, mem_kv = self.LLMModel[sub_task.model_type].get_resource_costs(rsu, sub_task)
 
                     mem = self.LLMModel[sub_task.model_type].precisions[sub_task.precision_req]['beta'] * self.LLMModel[sub_task.model_type].theta
@@ -429,15 +418,16 @@ class Environment(gym.Env):
                                 rsu.stats[sub_task.model_type]['success'] += 1
                                 # 奖励 = 基础分 + 剩余时间奖励
                                 # 计算类型最小完成率
-                                rate = 0
+                                # 计算该 RSU 内部 4 种模型的完成率
+                                rates = []
                                 for n, model in rsu.stats.items():
-                                    if model['total'] != 0:
-                                        rate_ = model['success'] / model['total']
-                                        rate = rate_ if rate_ > rate else rate
-                                    else:
-                                        rate_ = 0
-                                        rate = rate_
-                                reward = 8 + rate + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
+                                    s = model['success']
+                                    t = model['total']
+                                    rates.append(s / t if t > 0 else 1.0)
+                                # 1. 找出短板
+                                min_rate = min(rates)
+                                info[name] = min_rate
+                                reward = 8 + ((min_rate - 0.5) * 5) + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
                                 rsu.last_exec_status = 1.0  # [记录] 完美成功
                                 success = True
                             else:
@@ -478,16 +468,16 @@ class Environment(gym.Env):
                             if finish_time <= (parent.deadline - self.current_step * self.dt):
                                 rsu.stats[sub_task.model_type]['success'] += 1
                                 # 奖励 = 基础分 + 剩余时间奖励
-                                # 计算类型最小完成率
-                                rate = 0
+                                # 计算该 RSU 内部 4 种模型的完成率
+                                rates = []
                                 for n, model in rsu.stats.items():
-                                    if model['total'] != 0:
-                                        rate_ = model['success'] / model['total']
-                                        rate = rate_ if rate_ > rate else rate
-                                    else:
-                                        rate_ = 0
-                                        rate = rate_
-                                reward = 10 + rate + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
+                                    s = model['success']
+                                    t = model['total']
+                                    rates.append(s / t if t > 0 else 1.0)
+                                # 1. 找出短板
+                                min_rate = min(rates)
+                                info[name] = min_rate
+                                reward = 10 + ((min_rate - 0.5) * 5) + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
                                 rsu.last_exec_status = 1.0  # [记录] [记录] 完美成功
                                 success = True
                             else:#超时了
@@ -497,7 +487,6 @@ class Environment(gym.Env):
 
                     # 对应精度的模型没有部署，需要加载。
                     else:
-                        load_time = 1.02  # 先假设加载时间是1.02
                         if mem_static > rsu.memory_capacity - rsu.current_memory_used:
                             # 没有内存部署了，无法执行
                             parent.failed = True
@@ -523,16 +512,16 @@ class Environment(gym.Env):
                                 if finish_time <= (parent.deadline - self.current_step * self.dt):
                                     rsu.stats[sub_task.model_type]['success'] += 1
                                     # 奖励 = 基础分 + 剩余时间奖励
-                                    # 计算类型最小完成率
-                                    rate = 0
+                                    # 计算该 RSU 内部 4 种模型的完成率
+                                    rates = []
                                     for n, model in rsu.stats.items():
-                                        if model['total'] != 0:
-                                            rate_ = model['success'] / model['total']
-                                            rate = rate_ if rate_ > rate else rate
-                                        else:
-                                            rate_ = 0
-                                            rate = rate_
-                                    reward = 8 + rate + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
+                                        s = model['success']
+                                        t = model['total']
+                                        rates.append(s / t if t > 0 else 1.0)
+                                    # 1. 找出短板
+                                    min_rate = min(rates)
+                                    info[name] = min_rate
+                                    reward = 8 + ((min_rate - 0.5) * 5) + max(0, (parent.deadline - self.current_step * self.dt) - total_time)
                                     rsu.last_exec_status = 1.0  # [记录] [记录] 完美成功
                                     success = True
                                 else:
@@ -559,7 +548,7 @@ class Environment(gym.Env):
                         # --- 修改为 ---:
                         # 限制 latency 不能太小，防止除以 0.0001 导致爆炸
                         safe_latency = max(total_latency, 0.5)
-                        big_bonus = 20 + (10.0 / safe_latency)
+                        big_bonus = 50 + (10.0 / safe_latency)
 
                         # 并且做一个截断，防止偶尔的超大值
                         big_bonus = min(big_bonus, 50.0)
@@ -693,8 +682,8 @@ class Environment(gym.Env):
         base_time_per_model = np.random.uniform(0.5, 1.0)
         tolerance = base_time_per_model * len(selected_models)
         # 加上一点随机扰动 (0 ~ 0.5s)
-        tolerance += np.random.uniform(0, 0.5)
-
+        # tolerance += np.random.uniform(0, 0.5)
+        tolerance += np.random.uniform(2.0, 5.0)
         deadline = self.current_step * self.dt + tolerance
 
         # 4. 打包所需信息字典 (对应 Image 2 的格式)
